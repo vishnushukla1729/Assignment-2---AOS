@@ -1,0 +1,1147 @@
+diff --git a/kernel/.vm.c.swo b/kernel/.vm.c.swo
+deleted file mode 100644
+index c2e3993..0000000
+Binary files a/kernel/.vm.c.swo and /dev/null differ
+diff --git a/kernel/.vm.c.swp b/kernel/.vm.c.swp
+deleted file mode 100644
+index 1e2ac73..0000000
+Binary files a/kernel/.vm.c.swp and /dev/null differ
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 6e65a7c..fa6a0ac 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -9,13 +9,10 @@
+ #include "riscv.h"
+ #include "defs.h"
+ 
+-struct spinlock pa_ref_lock; 
+-int pa_ref_count[PHYSTOP/PGSIZE]; 
+-
+ void freerange(void *pa_start, void *pa_end);
+ 
+-extern char end[]; 
+-                 
++extern char end[]; // first address after kernel.
++                   // defined by kernel.ld.
+ 
+ struct run {
+   struct run *next;
+@@ -29,7 +26,6 @@ struct {
+ void
+ kinit()
+ {
+-  initlock(&pa_ref_lock, "pa_ref_lock"); 
+   initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+@@ -39,14 +35,8 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+-    //initially set counter to 1
+-    acquire(&pa_ref_lock);
+-    pa_ref_count[((uint64)p)/PGSIZE]=1; 
+-    release(&pa_ref_lock);
+-
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+     kfree(p);
+-  }
+ }
+ 
+ // Free the page of physical memory pointed at by v,
+@@ -56,28 +46,20 @@ freerange(void *pa_start, void *pa_end)
+ -void
+-kfree(void *pa)
++void kfree(void *pa)
+ {
+-  //decrease ref. counter
++  struct run *r;
++
++  if (((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
++    panic("kfree");
++
+   acquire(&pa_ref_lock);
+-  pa_ref_count[((uint64)pa)/PGSIZE]--;
+-  release(&pa_ref_lock);
+ 
+-  if(pa_ref_count[(uint64)pa/PGSIZE] ==0){
++  if (pa_ref_count[(uint64)pa / PGSIZE] <= 0) {
++    release(&pa_ref_lock);
++    panic("kfree: Reference count went negative!");
++  }
+ 
+-    struct run *r;
++  // Decrement reference count
++  pa_ref_count[(uint64)pa / PGSIZE]--;
+ 
+-    if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+-      panic("kfree");
++  if (pa_ref_count[(uint64)pa / PGSIZE] == 0) {
++    // Only free when count reaches 0
++    release(&pa_ref_lock);
+ 
+     // Fill with junk to catch dangling refs.
+     memset(pa, 1, PGSIZE);
+@@ -77,6 +83,8 @@ kfree(void *pa)
+     r->next = kmem.freelist;
+     kmem.freelist = r;
+     release(&kmem.lock);
++  } else {
++    release(&pa_ref_lock);
+   }
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -94,15 +76,7 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r){
++  if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+-
+-    //init counter to 1
+-    acquire(&pa_ref_lock);
+-    pa_ref_count[((uint64)r)/PGSIZE]=1; 
+-    release(&pa_ref_lock);
+-  }
+-  
+   return (void*)r;
+ }
+-
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 38839df..51a7805 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -10,9 +10,8 @@ struct spinlock tickslock;
+ uint ticks;
+ 
+ extern char trampoline[], uservec[], userret[];
+-extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); 
+-
+ 
++// in kernelvec.S, calls kerneltrap().
+ void kernelvec();
+ 
+ extern int devintr();
+@@ -23,13 +22,17 @@ trapinit(void)
+   initlock(&tickslock, "time");
+ }
+ 
+-
++// set up to take exceptions and traps while in the kernel.
+ void
+ trapinithart(void)
+ {
+   w_stvec((uint64)kernelvec);
+ }
+ 
++//
++// handle an interrupt, exception, or system call from user space.
++// called from trampoline.S
++//
+ void
+ usertrap(void)
+ {
+@@ -38,71 +41,31 @@ usertrap(void)
+   if((r_sstatus() & SSTATUS_SPP) != 0)
+     panic("usertrap: not from user mode");
+ 
+-
+
+   w_stvec((uint64)kernelvec);
+ 
+   struct proc *p = myproc();
+   
+-  
+   p->tf->epc = r_sepc();
+   
+   if(r_scause() == 8){
+-    
+
+ 
+     if(p->killed)
+       exit(-1);
+ 
+
+     p->tf->epc += 4;
+ 
+
+     intr_on();
+ 
+     syscall();
+-
+- 
+-  }else if(r_scause() == 15){  
+-    uint64 va = r_stval();
+-  uint64 flags;  
+-    uint64 oldPA;
+-    pte_t *pte;
+-    char *newPage;
+-    pagetable_t pgTbl = p->pagetable;
+-
+-  
+-    if(va >= MAXVA){ 
+-      p->killed = 1;
+-      exit(-1);
+-    }
+-    if((pte=walk(pgTbl,va,0)) == 0){ 
+-      p->killed = 1;
+-      exit(-1);
+-    }
+-    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){ 
+-      p->killed = 1;
+-      exit(-1);
+-    }
+-
+-    if (!(*pte & PTE_R)) {
+-      printf("usertrap: page fault on non-COW page at %p\n", va);
+-      p->killed = 1;  
+-      exit(-1);
+-    }
+-
+-   
+-    oldPA = PTE2PA(*pte); 
+-    if((newPage= kalloc())==0){
+-      p->killed = 1;
+-      exit(-1);
+-    }
+-    
+-    memmove(newPage, (char *)oldPA, PGSIZE);
+-    flags = PTE_FLAGS(*pte); 
+-    *pte = PA2PTE((uint64)newPage); 
+-    *pte |= flags; 
+-    *pte |= PTE_W; 
+-    
+-    kfree((void*)oldPA); 
+-
+-  }else if((which_dev = devintr()) != 0){
++  } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+@@ -113,7 +76,7 @@ usertrap(void)
+   if(p->killed)
+     exit(-1);
+ 
+
+   if(which_dev == 2)
+     yield();
+ 
+@@ -248,5 +211,3 @@ devintr()
+   }
+ }
+ 
+-
+-
+diff --git a/kernel/usertrap.c b/kernel/usertrap.c
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 57fc6a5..dd65184 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -6,9 +6,6 @@
+ #include "defs.h"
+ #include "fs.h"
+ 
+-extern struct spinlock pa_ref_lock;
+-extern int pa_ref_count[1<<20];
+-
+ /*
+  * the kernel's page table.
+  */
+@@ -78,8 +75,7 @@ kvminithart()
+ //   21..39 -- 9 bits of level-1 index.
+ //   12..20 -- 9 bits of level-0 index.
+ //    0..12 -- 12 bits of byte offset within the page.
+-
+-pte_t *
++static pte_t *
+ walk(pagetable_t pagetable, uint64 va, int alloc)
+ {
+   if(va >= MAXVA)
+@@ -320,49 +316,36 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // physical memory.
+ // returns 0 on success, -1 on failure.
+ // frees any allocated pages on failure.
+-
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
++  char *mem;
+ 
+-  for(i=0; i<sz; i += PGSIZE){
+-  
+-    if((pte=walk(old,i,0)) == 0)
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+-    
+-    pa=PTE2PA(*pte); 
+-    flags= PTE_FLAGS(*pte); 
+-
+-
+-    if (flags & PTE_W) {
+-      *pte &= ~PTE_W;
+-      *pte |= PTE_R;  
+-      flags &= ~PTE_W;
+-      flags |= PTE_R;
+-    }
+-
+- 
+-    if (mappages(new, i, PGSIZE, pa, flags) != 0)
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if((mem = kalloc()) == 0)
+       goto err;
+-
+-
+-    acquire(&pa_ref_lock);
+-    pa_ref_count[pa/PGSIZE]++;;
+-    release(&pa_ref_lock);
++    memmove(mem, (char*)pa, PGSIZE);
++    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++      kfree(mem);
++      goto err;
++    }
+   }
+   return 0;
+ 
+-  err:
+-  uvmunmap(new, 0, i / PGSIZE, 1);
++ err:
++  uvmunmap(new, 0, i, 1);
+   return -1;
+ }
+ 
+-
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -382,54 +365,25 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+-  pte_t *pte;
+-  char *new_pa;
+-  uint64 flags;
+-  uint64 n, va, pa;
++  uint64 n, va0, pa0;
+ 
+-  //process each page individually until pages are copied
+   while(len > 0){
+-    va = PGROUNDDOWN(dstva); //align va to page boundires
+-
+-    if(va >= MAXVA || dstva >= MAXVA) //check va are valid in user space
+-      return -1;
+-    if((pte = walk(pagetable, va, 0)) == 0) //find PTE in page tabel
+-      return -1;
+-    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) //check valid bit and user bit
++    va0 = PGROUNDDOWN(dstva);
++    pa0 = walkaddr(pagetable, va0);
++    if(pa0 == 0)
+       return -1;
+-
+-    pa = PTE2PA(*pte); //get pa of the 
+-
+-    //handle COW page if page is read-only
+-    if(((*pte) & PTE_W) == 0){
+-      if((new_pa = kalloc()) == 0) //allocate new physical page
+-        return -1;
+-      memmove(new_pa, (char*)pa, PGSIZE); //copy from old to new page
+-      flags = PTE_FLAGS(*pte); 
+-      *pte = PA2PTE(new_pa);
+-      *pte |= flags;
+-      *pte |= PTE_W;
+-
+-      kfree((void*)pa); //free old page
+-    }else{
+-      new_pa=(char*)pa; //new page already writable
+-    }
+-
+-    //determine size of data to copy
+-    n = PGSIZE - (dstva - va); //amount of data which fits on page
++    n = PGSIZE - (dstva - va0);
+     if(n > len)
+-      n = len; //copy remaining length if it fits in currnet page
+-    
+-    //copy data from kernel source buffer to destination page
+-    memmove((void *)(new_pa + (dstva - va)), src, n);
+-    len -= n; //go to next page and repeat process
++      n = len;
++    memmove((void *)(pa0 + (dstva - va0)), src, n);
++
++    len -= n;
+     src += n;
+-    dstva = va + PGSIZE;
++    dstva = va0 + PGSIZE;
+   }
+   return 0;
+ }
+ 
+-
+ // Copy from user to kernel.
+ // Copy len bytes to dst from virtual address srcva in a given page table.
+ // Return 0 on success, -1 on error.
+@@ -497,4 +451,3 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
+-
+diff --git a/testdiff b/testdiff
+deleted file mode 100644
+index 2077274..0000000
+--- a/testdiff
++++ /dev/null
+@@ -1,569 +0,0 @@
+-diff --git a/kernel/.vm.c.swo b/kernel/.vm.c.swo
+-deleted file mode 100644
+-index c2e3993..0000000
+-Binary files a/kernel/.vm.c.swo and /dev/null differ
+-diff --git a/kernel/.vm.c.swp b/kernel/.vm.c.swp
+-deleted file mode 100644
+-index 1e2ac73..0000000
+-Binary files a/kernel/.vm.c.swp and /dev/null differ
+-diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+-index 6e65a7c..fa6a0ac 100644
+---- a/kernel/kalloc.c
+-+++ b/kernel/kalloc.c
+-@@ -9,13 +9,10 @@
+- #include "riscv.h"
+- #include "defs.h"
+- 
+--struct spinlock pa_ref_lock; 
+--int pa_ref_count[PHYSTOP/PGSIZE]; 
+--
+- void freerange(void *pa_start, void *pa_end);
+- 
+--extern char end[]; 
+--                 
+-+extern char end[]; // first address after kernel.
+-+                   // defined by kernel.ld.
+- 
+- struct run {
+-   struct run *next;
+-@@ -29,7 +26,6 @@ struct {
+- void
+- kinit()
+- {
+--  initlock(&pa_ref_lock, "pa_ref_lock"); 
+-   initlock(&kmem.lock, "kmem");
+-   freerange(end, (void*)PHYSTOP);
+- }
+-@@ -39,14 +35,8 @@ freerange(void *pa_start, void *pa_end)
+- {
+-   char *p;
+-   p = (char*)PGROUNDUP((uint64)pa_start);
+--  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+--    //initially set counter to 1
+--    acquire(&pa_ref_lock);
+--    pa_ref_count[((uint64)p)/PGSIZE]=1; 
+--    release(&pa_ref_lock);
+--
+-+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+-     kfree(p);
+--  }
+- }
+- 
+- // Free the page of physical memory pointed at by v,
+-@@ -56,28 +46,20 @@ freerange(void *pa_start, void *pa_end)
+- void
+- kfree(void *pa)
+- {
+--  //decrease ref. counter
+--  acquire(&pa_ref_lock);
+--  pa_ref_count[((uint64)pa)/PGSIZE]--;
+--  release(&pa_ref_lock);
+--
+--  if(pa_ref_count[(uint64)pa/PGSIZE] ==0){
+--
+--    struct run *r;
+-+  struct run *r;
+- 
+--    if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+--      panic("kfree");
+-+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+-+    panic("kfree");
+- 
+--    // Fill with junk to catch dangling refs.
+--    memset(pa, 1, PGSIZE);
+-+  // Fill with junk to catch dangling refs.
+-+  memset(pa, 1, PGSIZE);
+- 
+--    r = (struct run*)pa;
+-+  r = (struct run*)pa;
+- 
+--    acquire(&kmem.lock);
+--    r->next = kmem.freelist;
+--    kmem.freelist = r;
+--    release(&kmem.lock);
+--  }
+-+  acquire(&kmem.lock);
+-+  r->next = kmem.freelist;
+-+  kmem.freelist = r;
+-+  release(&kmem.lock);
+- }
+- 
+- // Allocate one 4096-byte page of physical memory.
+-@@ -94,15 +76,7 @@ kalloc(void)
+-     kmem.freelist = r->next;
+-   release(&kmem.lock);
+- 
+--  if(r){
+-+  if(r)
+-     memset((char*)r, 5, PGSIZE); // fill with junk
+--
+--    //init counter to 1
+--    acquire(&pa_ref_lock);
+--    pa_ref_count[((uint64)r)/PGSIZE]=1; 
+--    release(&pa_ref_lock);
+--  }
+--  
+-   return (void*)r;
+- }
+--
+-diff --git a/kernel/trap.c b/kernel/trap.c
+-index 38839df..51a7805 100644
+---- a/kernel/trap.c
+-+++ b/kernel/trap.c
+-@@ -10,9 +10,8 @@ struct spinlock tickslock;
+- uint ticks;
+- 
+- extern char trampoline[], uservec[], userret[];
+--extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); 
+--
+- 
+-+// in kernelvec.S, calls kerneltrap().
+- void kernelvec();
+- 
+- extern int devintr();
+-@@ -23,13 +22,17 @@ trapinit(void)
+-   initlock(&tickslock, "time");
+- }
+- 
+--
+-+// set up to take exceptions and traps while in the kernel.
+- void
+- trapinithart(void)
+- {
+-   w_stvec((uint64)kernelvec);
+- }
+- 
+-+//
+-+// handle an interrupt, exception, or system call from user space.
+-+// called from trampoline.S
+-+//
+- void
+- usertrap(void)
+- {
+-@@ -38,71 +41,31 @@ usertrap(void)
+-   if((r_sstatus() & SSTATUS_SPP) != 0)
+-     panic("usertrap: not from user mode");
+- 
+--
+-+  // send interrupts and exceptions to kerneltrap(),
+-+  // since we're now in the kernel.
+-   w_stvec((uint64)kernelvec);
+- 
+-   struct proc *p = myproc();
+-   
+--  
+-+  // save user program counter.
+-   p->tf->epc = r_sepc();
+-   
+-   if(r_scause() == 8){
+--    
+-+    // system call
+- 
+-     if(p->killed)
+-       exit(-1);
+- 
+-+    // sepc points to the ecall instruction,
+-+    // but we want to return to the next instruction.
+-     p->tf->epc += 4;
+- 
+-+    // an interrupt will change sstatus &c registers,
+-+    // so don't enable until done with those registers.
+-     intr_on();
+- 
+-     syscall();
+--
+-- 
+--  }else if(r_scause() == 15){  
+--    uint64 va = r_stval();
+--  uint64 flags;  
+--    uint64 oldPA;
+--    pte_t *pte;
+--    char *newPage;
+--    pagetable_t pgTbl = p->pagetable;
+--
+--  
+--    if(va >= MAXVA){ 
+--      p->killed = 1;
+--      exit(-1);
+--    }
+--    if((pte=walk(pgTbl,va,0)) == 0){ 
+--      p->killed = 1;
+--      exit(-1);
+--    }
+--    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){ 
+--      p->killed = 1;
+--      exit(-1);
+--    }
+--
+--    if (!(*pte & PTE_R)) {
+--      printf("usertrap: page fault on non-COW page at %p\n", va);
+--      p->killed = 1;  
+--      exit(-1);
+--    }
+--
+--   
+--    oldPA = PTE2PA(*pte); 
+--    if((newPage= kalloc())==0){
+--      p->killed = 1;
+--      exit(-1);
+--    }
+--    
+--    memmove(newPage, (char *)oldPA, PGSIZE);
+--    flags = PTE_FLAGS(*pte); 
+--    *pte = PA2PTE((uint64)newPage); 
+--    *pte |= flags; 
+--    *pte |= PTE_W; 
+--    
+--    kfree((void*)oldPA); 
+--
+--  }else if((which_dev = devintr()) != 0){
+-+  } else if((which_dev = devintr()) != 0){
+-     // ok
+-   } else {
+-     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+-@@ -113,7 +76,7 @@ usertrap(void)
+-   if(p->killed)
+-     exit(-1);
+- 
+--
+-+  // give up the CPU if this is a timer interrupt.
+-   if(which_dev == 2)
+-     yield();
+- 
+-@@ -248,5 +211,3 @@ devintr()
+-   }
+- }
+- 
+--
+--
+-diff --git a/kernel/usertrap.c b/kernel/usertrap.c
+-deleted file mode 100644
+-index e69de29..0000000
+-diff --git a/kernel/vm.c b/kernel/vm.c
+-index 57fc6a5..dd65184 100644
+---- a/kernel/vm.c
+-+++ b/kernel/vm.c
+-@@ -6,9 +6,6 @@
+- #include "defs.h"
+- #include "fs.h"
+- 
+--extern struct spinlock pa_ref_lock;
+--extern int pa_ref_count[1<<20];
+--
+- /*
+-  * the kernel's page table.
+-  */
+-@@ -78,8 +75,7 @@ kvminithart()
+- //   21..39 -- 9 bits of level-1 index.
+- //   12..20 -- 9 bits of level-0 index.
+- //    0..12 -- 12 bits of byte offset within the page.
+--
+--pte_t *
+-+static pte_t *
+- walk(pagetable_t pagetable, uint64 va, int alloc)
+- {
+-   if(va >= MAXVA)
+-@@ -320,49 +316,36 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+- // physical memory.
+- // returns 0 on success, -1 on failure.
+- // frees any allocated pages on failure.
+--
+- int
+- uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+- {
+-   pte_t *pte;
+-   uint64 pa, i;
+-   uint flags;
+-+  char *mem;
+- 
+--  for(i=0; i<sz; i += PGSIZE){
+--  
+--    if((pte=walk(old,i,0)) == 0)
+-+  for(i = 0; i < sz; i += PGSIZE){
+-+    if((pte = walk(old, i, 0)) == 0)
+-       panic("uvmcopy: pte should exist");
+-     if((*pte & PTE_V) == 0)
+-       panic("uvmcopy: page not present");
+--    
+--    pa=PTE2PA(*pte); 
+--    flags= PTE_FLAGS(*pte); 
+--
+--
+--    if (flags & PTE_W) {
+--      *pte &= ~PTE_W;
+--      *pte |= PTE_R;  
+--      flags &= ~PTE_W;
+--      flags |= PTE_R;
+--    }
+--
+-- 
+--    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+-+    pa = PTE2PA(*pte);
+-+    flags = PTE_FLAGS(*pte);
+-+    if((mem = kalloc()) == 0)
+-       goto err;
+--
+--
+--    acquire(&pa_ref_lock);
+--    pa_ref_count[pa/PGSIZE]++;;
+--    release(&pa_ref_lock);
+-+    memmove(mem, (char*)pa, PGSIZE);
+-+    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-+      kfree(mem);
+-+      goto err;
+-+    }
+-   }
+-   return 0;
+- 
+--  err:
+--  uvmunmap(new, 0, i / PGSIZE, 1);
+-+ err:
+-+  uvmunmap(new, 0, i, 1);
+-   return -1;
+- }
+- 
+--
+- // mark a PTE invalid for user access.
+- // used by exec for the user stack guard page.
+- void
+-@@ -382,54 +365,25 @@ uvmclear(pagetable_t pagetable, uint64 va)
+- int
+- copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+- {
+--  pte_t *pte;
+--  char *new_pa;
+--  uint64 flags;
+--  uint64 n, va, pa;
+-+  uint64 n, va0, pa0;
+- 
+--  //process each page individually until pages are copied
+-   while(len > 0){
+--    va = PGROUNDDOWN(dstva); //align va to page boundires
+--
+--    if(va >= MAXVA || dstva >= MAXVA) //check va are valid in user space
+--      return -1;
+--    if((pte = walk(pagetable, va, 0)) == 0) //find PTE in page tabel
+--      return -1;
+--    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) //check valid bit and user bit
+-+    va0 = PGROUNDDOWN(dstva);
+-+    pa0 = walkaddr(pagetable, va0);
+-+    if(pa0 == 0)
+-       return -1;
+--
+--    pa = PTE2PA(*pte); //get pa of the 
+--
+--    //handle COW page if page is read-only
+--    if(((*pte) & PTE_W) == 0){
+--      if((new_pa = kalloc()) == 0) //allocate new physical page
+--        return -1;
+--      memmove(new_pa, (char*)pa, PGSIZE); //copy from old to new page
+--      flags = PTE_FLAGS(*pte); 
+--      *pte = PA2PTE(new_pa);
+--      *pte |= flags;
+--      *pte |= PTE_W;
+--
+--      kfree((void*)pa); //free old page
+--    }else{
+--      new_pa=(char*)pa; //new page already writable
+--    }
+--
+--    //determine size of data to copy
+--    n = PGSIZE - (dstva - va); //amount of data which fits on page
+-+    n = PGSIZE - (dstva - va0);
+-     if(n > len)
+--      n = len; //copy remaining length if it fits in currnet page
+--    
+--    //copy data from kernel source buffer to destination page
+--    memmove((void *)(new_pa + (dstva - va)), src, n);
+--    len -= n; //go to next page and repeat process
+-+      n = len;
+-+    memmove((void *)(pa0 + (dstva - va0)), src, n);
+-+
+-+    len -= n;
+-     src += n;
+--    dstva = va + PGSIZE;
+-+    dstva = va0 + PGSIZE;
+-   }
+-   return 0;
+- }
+- 
+--
+- // Copy from user to kernel.
+- // Copy len bytes to dst from virtual address srcva in a given page table.
+- // Return 0 on success, -1 on error.
+-@@ -497,4 +451,3 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+-     return -1;
+-   }
+- }
+--
+-diff --git a/testdiff.diff b/testdiff.diff
+-deleted file mode 100644
+-index 9c6c776..0000000
+---- a/testdiff.diff
+-+++ /dev/null
+-@@ -1,146 +0,0 @@
+--diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+--index 6e65a7c..f23ae31 100644
+----- a/kernel/kalloc.c
+--+++ b/kernel/kalloc.c
+--@@ -9,13 +9,13 @@
+-- #include "riscv.h"
+-- #include "defs.h"
+-- 
+---struct spinlock pa_ref_lock; 
+---int pa_ref_count[PHYSTOP/PGSIZE]; 
+--+struct spinlock pa_ref_lock; //proj2- reference counter spinlock
+--+int pa_ref_count[PHYSTOP/PGSIZE]; //counter of each page
+-- 
+-- void freerange(void *pa_start, void *pa_end);
+-- 
+---extern char end[]; 
+---                 
+--+extern char end[]; // first address after kernel.
+--+                   // defined by kernel.ld.
+-- 
+-- struct run {
+--   struct run *next;
+--@@ -29,7 +29,7 @@ struct {
+-- void
+-- kinit()
+-- {
+---  initlock(&pa_ref_lock, "pa_ref_lock"); 
+--+  initlock(&pa_ref_lock, "pa_ref_lock"); //proj2- init ref counter lock
+--   initlock(&kmem.lock, "kmem");
+--   freerange(end, (void*)PHYSTOP);
+-- }
+--@@ -105,4 +105,3 @@ kalloc(void)
+--   
+--   return (void*)r;
+-- }
+---
+--diff --git a/kernel/trap.c b/kernel/trap.c
+--index 38839df..dcd98a7 100644
+----- a/kernel/trap.c
+--+++ b/kernel/trap.c
+--@@ -10,9 +10,9 @@ struct spinlock tickslock;
+-- uint ticks;
+-- 
+-- extern char trampoline[], uservec[], userret[];
+---extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); 
+---
+--+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); //proj2 COW 
+-- 
+--+// in kernelvec.S, calls kerneltrap().
+-- void kernelvec();
+-- 
+-- extern int devintr();
+--@@ -23,13 +23,18 @@ trapinit(void)
+--   initlock(&tickslock, "time");
+-- }
+-- 
+---
+--+// set up to take exceptions and traps while in the kernel.
+-- void
+-- trapinithart(void)
+-- {
+--   w_stvec((uint64)kernelvec);
+-- }
+-- 
+--+//
+--+// handle an interrupt, exception, or system call from user space.
+--+// called from trampoline.S
+--+//
+--+
+-- void
+-- usertrap(void)
+-- {
+--@@ -43,11 +48,11 @@ usertrap(void)
+-- 
+--   struct proc *p = myproc();
+--   
+---  
+--+  // save user program counter.
+--   p->tf->epc = r_sepc();
+--   
+--   if(r_scause() == 8){
+---    
+--+    // system call
+-- 
+--     if(p->killed)
+--       exit(-1);
+--@@ -87,20 +92,21 @@ usertrap(void)
+--       exit(-1);
+--     }
+-- 
+---   
+---    oldPA = PTE2PA(*pte); 
+--+    //allocate new physical page
+--+    oldPA = PTE2PA(*pte); //get old page physical address
+--     if((newPage= kalloc())==0){
+--       p->killed = 1;
+--       exit(-1);
+--     }
+--     
+--+    //copy old page to new page and update PTEs
+--     memmove(newPage, (char *)oldPA, PGSIZE);
+---    flags = PTE_FLAGS(*pte); 
+---    *pte = PA2PTE((uint64)newPage); 
+---    *pte |= flags; 
+---    *pte |= PTE_W; 
+--+    flags = PTE_FLAGS(*pte); //fetch current flags
+--+    *pte = PA2PTE((uint64)newPage); //set new physical page
+--+    *pte |= flags; // restore flags
+--+    *pte |= PTE_W; //set write bit
+--     
+---    kfree((void*)oldPA); 
+--+    kfree((void*)oldPA); //free old physical page
+-- 
+--   }else if((which_dev = devintr()) != 0){
+--     // ok
+--@@ -113,7 +119,7 @@ usertrap(void)
+--   if(p->killed)
+--     exit(-1);
+-- 
+---
+--+  // give up the CPU if this is a timer interrupt.
+--   if(which_dev == 2)
+--     yield();
+-- 
+--@@ -249,4 +255,3 @@ devintr()
+-- }
+-- 
+-- 
+---
+--diff --git a/kernel/vm.c b/kernel/vm.c
+--index 57fc6a5..625c937 100644
+----- a/kernel/vm.c
+--+++ b/kernel/vm.c
+--@@ -321,6 +321,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+-- // returns 0 on success, -1 on failure.
+-- // frees any allocated pages on failure.
+-- 
+--+//Project2 Implementation of uvmcopy() to support COW 
+-- int
+-- uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+-- {
+--@@ -497,4 +498,3 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+--     return -1;
+--   }
+-- }
+---
+-diff --git a/user/sh.c b/user/sh.c
+-index 23a5d31..a593bc0 100644
+---- a/user/sh.c
+-+++ b/user/sh.c
+-@@ -52,7 +52,7 @@ struct backcmd {
+- int fork1(void);  // Fork but panics on failure.
+- void panic(char*);
+- struct cmd *parsecmd(char*);
+--__attribute__((noreturn))
+-+
+- // Execute cmd.  Never returns.
+- void
+- runcmd(struct cmd *cmd)
+-diff --git a/usertrap.c b/usertrap.c
+-deleted file mode 100644
+-index e69de29..0000000
+-diff --git a/xv6.out b/xv6.out
+-deleted file mode 100644
+-index e69de29..0000000
+diff --git a/time.txt b/time.txt
+deleted file mode 100644
+index 797c9b7..0000000
+--- a/time.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-100
+-
+diff --git a/user/sh.c b/user/sh.c
+index 23a5d31..a593bc0 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -52,7 +52,7 @@ struct backcmd {
+ int fork1(void);  // Fork but panics on failure.
+ void panic(char*);
+ struct cmd *parsecmd(char*);
+-__attribute__((noreturn))
++
+ // Execute cmd.  Never returns.
+ void
+ runcmd(struct cmd *cmd)
+diff --git a/usertrap.c b/usertrap.c
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/xv6.out b/xv6.out
+deleted file mode 100644
+index 5338d22..0000000
+--- a/xv6.out
++++ /dev/null
+@@ -1,145 +0,0 @@
+-
+-xv6 kernel is booting
+-
+-virtio disk init 0
+-hart 1 starting
+-hart 2 starting
+-init: starting sh
+-$ usertests
+-usertests starting
+-test reparent2: OK
+-test pgbug: OK
+-test sbrkbugs: usertrap(): unexpected scause 0x000000000000000c pid=3207
+-            sepc=0x0000000000004602 stval=0x0000000000004602
+-usertrap(): unexpected scause 0x000000000000000c pid=3208
+-            sepc=0x0000000000004602 stval=0x0000000000004602
+-OK
+-test badarg: OK
+-test reparent: OK
+-test twochildren: OK
+-test forkfork: OK
+-test forkforkfork: OK
+-test argptest: OK
+-test createdelete: OK
+-test linkunlink: OK
+-test linktest: OK
+-test unlinkread: OK
+-test concreate: OK
+-test subdir: OK
+-test fourfiles: OK
+-test sharedfd: OK
+-test exectest: OK
+-test bigargtest: OK
+-test bigwrite: OK
+-test bsstest: OK
+-test sbrkbasic: OK
+-test sbrkmuch: OK
+-test kernmem: usertrap(): unexpected scause 0x000000000000000d pid=6186
+-            sepc=0x0000000000000768 stval=0x0000000080000000
+-usertrap(): unexpected scause 0x000000000000000d pid=6187
+-            sepc=0x0000000000000768 stval=0x000000008000c350
+-usertrap(): unexpected scause 0x000000000000000d pid=6188
+-            sepc=0x0000000000000768 stval=0x00000000800186a0
+-usertrap(): unexpected scause 0x000000000000000d pid=6189
+-            sepc=0x0000000000000768 stval=0x00000000800249f0
+-usertrap(): unexpected scause 0x000000000000000d pid=6190
+-            sepc=0x0000000000000768 stval=0x0000000080030d40
+-usertrap(): unexpected scause 0x000000000000000d pid=6191
+-            sepc=0x0000000000000768 stval=0x000000008003d090
+-usertrap(): unexpected scause 0x000000000000000d pid=6192
+-            sepc=0x0000000000000768 stval=0x00000000800493e0
+-usertrap(): unexpected scause 0x000000000000000d pid=6193
+-            sepc=0x0000000000000768 stval=0x0000000080055730
+-usertrap(): unexpected scause 0x000000000000000d pid=6194
+-            sepc=0x0000000000000768 stval=0x0000000080061a80
+-usertrap(): unexpected scause 0x000000000000000d pid=6195
+-            sepc=0x0000000000000768 stval=0x000000008006ddd0
+-usertrap(): unexpected scause 0x000000000000000d pid=6196
+-            sepc=0x0000000000000768 stval=0x000000008007a120
+-usertrap(): unexpected scause 0x000000000000000d pid=6197
+-            sepc=0x0000000000000768 stval=0x0000000080086470
+-usertrap(): unexpected scause 0x000000000000000d pid=6198
+-            sepc=0x0000000000000768 stval=0x00000000800927c0
+-usertrap(): unexpected scause 0x000000000000000d pid=6199
+-            sepc=0x0000000000000768 stval=0x000000008009eb10
+-usertrap(): unexpected scause 0x000000000000000d pid=6200
+-            sepc=0x0000000000000768 stval=0x00000000800aae60
+-usertrap(): unexpected scause 0x000000000000000d pid=6201
+-            sepc=0x0000000000000768 stval=0x00000000800b71b0
+-usertrap(): unexpected scause 0x000000000000000d pid=6202
+-            sepc=0x0000000000000768 stval=0x00000000800c3500
+-usertrap(): unexpected scause 0x000000000000000d pid=6203
+-            sepc=0x0000000000000768 stval=0x00000000800cf850
+-usertrap(): unexpected scause 0x000000000000000d pid=6204
+-            sepc=0x0000000000000768 stval=0x00000000800dbba0
+-usertrap(): unexpected scause 0x000000000000000d pid=6205
+-            sepc=0x0000000000000768 stval=0x00000000800e7ef0
+-usertrap(): unexpected scause 0x000000000000000d pid=6206
+-            sepc=0x0000000000000768 stval=0x00000000800f4240
+-usertrap(): unexpected scause 0x000000000000000d pid=6207
+-            sepc=0x0000000000000768 stval=0x0000000080100590
+-usertrap(): unexpected scause 0x000000000000000d pid=6208
+-            sepc=0x0000000000000768 stval=0x000000008010c8e0
+-usertrap(): unexpected scause 0x000000000000000d pid=6209
+-            sepc=0x0000000000000768 stval=0x0000000080118c30
+-usertrap(): unexpected scause 0x000000000000000d pid=6210
+-            sepc=0x0000000000000768 stval=0x0000000080124f80
+-usertrap(): unexpected scause 0x000000000000000d pid=6211
+-            sepc=0x0000000000000768 stval=0x00000000801312d0
+-usertrap(): unexpected scause 0x000000000000000d pid=6212
+-            sepc=0x0000000000000768 stval=0x000000008013d620
+-usertrap(): unexpected scause 0x000000000000000d pid=6213
+-            sepc=0x0000000000000768 stval=0x0000000080149970
+-usertrap(): unexpected scause 0x000000000000000d pid=6214
+-            sepc=0x0000000000000768 stval=0x0000000080155cc0
+-usertrap(): unexpected scause 0x000000000000000d pid=6215
+-            sepc=0x0000000000000768 stval=0x0000000080162010
+-usertrap(): unexpected scause 0x000000000000000d pid=6216
+-            sepc=0x0000000000000768 stval=0x000000008016e360
+-usertrap(): unexpected scause 0x000000000000000d pid=6217
+-            sepc=0x0000000000000768 stval=0x000000008017a6b0
+-usertrap(): unexpected scause 0x000000000000000d pid=6218
+-            sepc=0x0000000000000768 stval=0x0000000080186a00
+-usertrap(): unexpected scause 0x000000000000000d pid=6219
+-            sepc=0x0000000000000768 stval=0x0000000080192d50
+-usertrap(): unexpected scause 0x000000000000000d pid=6220
+-            sepc=0x0000000000000768 stval=0x000000008019f0a0
+-usertrap(): unexpected scause 0x000000000000000d pid=6221
+-            sepc=0x0000000000000768 stval=0x00000000801ab3f0
+-usertrap(): unexpected scause 0x000000000000000d pid=6222
+-            sepc=0x0000000000000768 stval=0x00000000801b7740
+-usertrap(): unexpected scause 0x000000000000000d pid=6223
+-            sepc=0x0000000000000768 stval=0x00000000801c3a90
+-usertrap(): unexpected scause 0x000000000000000d pid=6224
+-            sepc=0x0000000000000768 stval=0x00000000801cfde0
+-usertrap(): unexpected scause 0x000000000000000d pid=6225
+-            sepc=0x0000000000000768 stval=0x00000000801dc130
+-OK
+-test sbrkfail: usertrap(): unexpected scause 0x000000000000000d pid=6237
+-            sepc=0x0000000000003a68 stval=0x0000000000010000
+-OK
+-test sbrkarg: OK
+-test validatetest: OK
+-test stacktest: usertrap(): unexpected scause 0x000000000000000d pid=6241
+-            sepc=0x00000000000007d0 stval=0x000000000000dc60
+-OK
+-test opentest: OK
+-test writetest: OK
+-test writebig: OK
+-test createtest: OK
+-test openiput: OK
+-test exitiput: OK
+-test iput: OK
+-test mem: OK
+-test pipe1: OK
+-test preempt: kill... wait... OK
+-test exitwait: OK
+-test rmdot: OK
+-test fourteen: OK
+-test bigfile: OK
+-test dirfile: OK
+-test iref: OK
+-test forktest: OK
+-test bigdir: OK
+-ALL TESTS PASSED
+-$ qemu-system-riscv64: terminating on signal 15 from pid 3886263 (make)
